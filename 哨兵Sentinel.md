@@ -4,7 +4,7 @@ Redis主从模式下，主节点一旦挂了，则写操作无法继续执行，
 
 几个名词解释
 
-<img src="C:\Users\yangzilong\AppData\Roaming\Typora\typora-user-images\image-20230905202959955.png" alt="image-20230905202959955" style="zoom:67%;" />
+![image-20230921213147923](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230921213147923.png)
 
 Redis Sentinel 概念：**Redis Sentinel 是 Redis 的高可用实现方案**，在实际的⽣产环境中，对**提高整个系统的高可用**是⾮常有帮助的。
 
