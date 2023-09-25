@@ -8,7 +8,7 @@
 >
 > 狭义的集群：redis为了解决存储大量数据时内存空间不足的问题，提供的集群cluster模式。
 
-Redis的哨兵模式, 目的/作用是提⾼了redis分布式系统的可⽤性. 但是真正⽤来存储数据的还是 master 和 slave 节点. 所有的数据都需要存储在单个 master 和 slave 节点中.
+Redis的哨兵模式, 目的/作用是提⾼redis分布式系统的可⽤性, 也就是主节点挂了之后可以自动化的进行主从切换. 但是真正⽤来存储数据的还是 master 和 slave 节点. 所有的数据都需要存储在单个 master 和 slave 节点中.
 
 **如果数据量很大, 接近/超出了 master / slave 所在机器的物理内存, 就可能出现严重问题了.**
 
@@ -81,7 +81,9 @@ key 映射到分⽚序号的过程不再是简单求余了, ⽽是改成以下�
 
 **优点: 大大降低了扩容时数据搬运的规模, 提高了扩容操作的效率.** 
 
-**缺点: 数据分配不均匀，有的多有的少（数据倾斜）**
+**缺点: 扩容之后数据分配不均匀，有的多有的少（数据倾斜）**
+
+比如从三个分片扩容到四个分片时, 四号分片有1/6的数据, 而12可能有33%, 3号有1/6的数据.
 
 #### 3. 哈希槽分区算法 (Redis 使用)
 
@@ -95,7 +97,7 @@ key 映射到分⽚序号的过程不再是简单求余了, ⽽是改成以下�
 
 相当于是把全部的哈希值, 映射到 16384 个槽位上, 也就是 [0, 16383].
 
-然后再把这些槽位⽐较均匀的分配给每个分⽚. 每个分⽚的节点都需要记录⾃⼰持有哪些槽位.
+然后再把这些槽位⽐较均匀的分配给每个分⽚. 每个分⽚的节点都需要记录⾃⼰持有哪些槽位.(通过位图)
 
 假设当前有三个分⽚, ⼀种可能的槽位分配⽅式:
 
@@ -187,7 +189,7 @@ CLUSTER MEET <ip> <port>
 >
 > <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923144423126.png" alt="image-20230923144423126" style="zoom:67%;" /><img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923144432520.png" alt="image-20230923144432520" style="zoom:67%;" />
 
-本节接下来的内容将介绍启动节点的方法， 和集群有关的数据结构， 以及 `CLUSTER MEET` 命令的实现原理。
+本节接下来的内容将介绍启动节点的方法， 和集群模式有关的数据结构， 以及 `CLUSTER MEET` 命令的实现原理。
 
 ### 启动节点-集群模式下的Redis服务器
 
@@ -211,17 +213,17 @@ CLUSTER MEET <ip> <port>
 >
 > 诸如此类。
 
-<u>除此之外， 节点会继续使用 `redisServer` 结构来保存服务器的状态， 使用 `redisClient` 结构来保存客户端的状态</u>
+除此之外， 节点会继续使用 `redisServer` 结构来保存服务器的状态， 使用 `redisClient` 结构来保存客户端的状态
 
 <u>至于那些只有在集群模式下才会用到的数据， 节点将它们保存到了 `cluster.h/clusterNode` 结构， `cluster.h/clusterLink` 结构， 以及 `cluster.h/clusterState` 结构里面， 接下来的一节将对这三种数据结构进行介绍。</u>
 
-> 所以, 集群中的节点, 实际上就是一个处于集群模式下的Redis服务器, 类似于 **Sentinel 本质上只是一个运行在特殊模式下的 Redis 服务器**， 所以启动 Sentinel 的**第一步， 就是初始化一个普通的 Redis 服务器**
+> 所以, 集群中的节点, 实际上就是一个处于集群模式下的Redis服务器, 类似于 Sentinel 本质上只是一个运行在特殊模式下的 Redis 服务器， 所以启动 Sentinel 的第一步， 就是初始化一个普通的 Redis 服务器
 >
 > 而使一个Redis服务器运行在集群模式下, 可以在配置文件中将cluster-enabled设置为yes, Redis服务器启动时会根据这个配置项决定是否开启集群模式
 >
 > 和哨兵模式不太一样的是, 集群模式下的Redis服务器会继续使用所有在单机模式中使用的服务器组件, 除此之外, 有关集群的功能, 主要使用`cluster.h/clusterNode` 结构， `cluster.h/clusterLink` 结构， 以及 `cluster.h/clusterState` 结构, 共三个集群数据结构来实现.
 
-### 集群数据结构
+### 集群模式相关数据结构
 
 #### cluster.h/clusterNode
 
@@ -229,7 +231,9 @@ CLUSTER MEET <ip> <port>
 
 **每个节点(集群模式的Redis服务器)都会使用一个 `clusterNode` 结构来记录自己的状态， 并为集群中的所有其他节点（包括主节点和从节点）都创建一个相应的 `clusterNode` 结构， 以此来记录其他节点的状态：**
 
-```
+> 集群中的每个节点都会为集群中的每个节点创建clusterNode结构, 以此记录每个节点的状态.
+
+```c
 struct clusterNode {
 
     // 创建节点的时间
@@ -265,7 +269,7 @@ struct clusterNode {
 
 **`clusterNode` 结构的 `link` 属性是一个 `clusterLink` 结构， 该结构保存了连接节点所需的有关信息**， 比如套接字描述符， 输入缓冲区和输出缓冲区：
 
-```
+```c
 typedef struct clusterLink {
 
     // 连接的创建时间
@@ -288,13 +292,16 @@ typedef struct clusterLink {
 
 `redisClient` 结构和 `clusterLink` 结构的相同和不同之处
 
-`redisClient` 结构和 `clusterLink` 结构都有自己的套接字描述符和输入、输出缓冲区， 这两个结构的区别在于， `redisClient` 结构中的套接字和缓冲区是用于连接客户端的， 而 `clusterLink` 结构中的套接字和缓冲区则是用于连接节点的。
+`redisClient` 结构和 `clusterLink` 结构都有自己的套接字描述符和输入、输出缓冲区
+这两个结构的区别在于， `redisClient` 结构中的套接字和缓冲区是用于连接客户端的， 而 `clusterLink` 结构中的套接字和缓冲区则是用于连接节点的。
 
 #### cluster.h/clusterState
 
 **最后， <u>每个节点都保存</u>着一个 `clusterState` 结构， 这个结构记录了在当前节点的视角下， 集群目前所处的状态 —— 比如集群是在线还是下线， 集群包含多少个/哪些节点， 集群当前的配置纪元**， 诸如此类：
 
-```
+> clusterNode存储某个节点的状态, clusterState是某节点的视角下, 整个集群的状态
+
+```c
 typedef struct clusterState {
 
     // 指向当前节点的指针
@@ -309,7 +316,7 @@ typedef struct clusterState {
     // 集群中至少处理着一个槽的节点的数量
     int size;
 
-    // 集群节点名单（包括 myself 节点）
+    // 存储集群所有节点的字典（包括 myself 节点）
     // 字典的键为节点的名字，字典的值为节点对应的 clusterNode 结构
     dict *nodes;
 
@@ -332,9 +339,9 @@ typedef struct clusterState {
 > - 不过在节点 7001 创建的 `clusterState` 结构中， `myself` 指针将指向代表节点 7001 的 `clusterNode` 结构， 而节点 7000 和节点 7002 则是集群中的其他节点。
 > - 而在节点 7002 创建的 `clusterState` 结构中， `myself` 指针将指向代表节点 7002 的 `clusterNode` 结构， 而节点 7000 和节点 7001 则是集群中的其他节点。
 
-也就是说, 集群中的每个节点 - 处于集群模式的Redis服务器, 都会用一个clusterNode结构去描述每一个集群中的节点, 若集群有10个节点, 则10个节点中就共有10 * 10个clusterNode结构体的实例化对象
+也就是说, 集群中的每个节点 - 处于集群模式的Redis服务器, 都会用一个clusterNode结构去描述集群中的每一个节点, 若集群有10个节点, 则10个节点中就共有10 * 10个clusterNode结构体的实例化对象
 
-每个节点内部的clusterState中的dict *nodes中的代表自己的那个键值对的值(clusterNode\*类型)指向的对象和myself指针指向同一个clusterNode, 都是记录自己状态的clusterNode
+每个节点内部的clusterState中的dict *nodes中的代表自己的那个键值对的值(clusterNode\*类型)指向的对象和myself指针指向的是同一个clusterNode, 都是记录自己状态的clusterNode
 
 ### CLUSTER MEET 命令的实现
 
@@ -355,17 +362,23 @@ CLUSTER MEET <ip> <port>
 
 > 这里的MEET, PING, PONG消息见7. 消息
 >
-> 命令是直接给Redis客户端 - Redis使用者提供使用的, 而消息是Redis的内部实现.
+> 命令是直接给Redis客户端 - Redis使用者提供使用的, 而消息是Redis的某命令的内部实现. 也就是节点之间是通过消息进行通信的.
 
 ![image-20230923150144050](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923150144050.png)
 
 之后，节点 A 会将节点 B 的信息通过 Gossip 协议传播给集群中的其他节点，让其他节点也与节点 B 进行握手，最终，经过一段时间之后，节点 B 会被集群中的所有节点认识。
 
-也就是说, 若集群中当前有N个节点, 需要新增一个X节点, 则只需向N个节点中的一个节点发送 CLUSTER MEET x_ip x_port即可将X节点加入集群中
+即, 若集群中当前有N个节点, 需要新增一个X节点, 则只需向N个节点中的一个节点发送 CLUSTER MEET x_ip x_port即可将X节点加入集群中
+
+> 重点回顾:
+>
+> - 简单介绍了集群中的节点到底是什么, 其实就是一个处于集群模式的Redis服务器, 和Sentinel很像
+> - 介绍了集群相关的数据结构, clusterNode clusterLink clusterState, 很重要, 下面的内容会不断使用到这三个数据结构(实际上是两个, clusterLink相对使用较少), 因为集群的很多功能都是和这三个数据结构关联的
+> - CLUSTER MEET命令用于将一个节点加入集群中, 内部实现是通过节点之间发送消息实现的(消息见文章第7部分), 还有就是创建clusterNode添加到clusterState中, 毕竟clusterState是节点存储集群状态的数据结构~
 
 ## 2. 槽指派(指派是一个动词)
 
-**Redis集群通过分片的方式来保存数据库中的键值对：集群的整个数据库被分为16384个槽（slot），数据库中的每个键都属于这16384个槽的其中一个，集群中的每个节点可以处理0个或最多16384个槽。**
+**Redis集群通过分片的方式来保存数据库中的键值对：集群的整个数据库被分为16384个槽（slot），数据库中的每个键都属于这16384个槽的其中一个，集群中的每个节点可以处理0个或最多16384个槽。(理想情况下, 每个分片负责1/分片数量的槽位, 也就是存储1/分片数量的键值对(大致))**
 
 当数据库中的16384个槽都有节点在处理时，**集群处于上线状态（ok）**；相反地，如果数据库中有任何一个槽没有得到处理，那么**集群处于下线状态（fail）。**
 
@@ -385,7 +398,7 @@ CLUSTER MEET <ip> <port>
 > cluster_stats_messages_received:28
 > ```
 >
-> **通过向节点发送CLUSTER ADDSLOTS命令，我们可以将一个或多个槽指派（assign）给节点负责**：
+> 通过向节点发送CLUSTER ADDSLOTS命令，我们可以将一个或多个槽指派（assign）给节点负责：
 >
 > ```
 > CLUSTER ADDSLOTS <slot> [slot ...]
@@ -438,20 +451,21 @@ CLUSTER MEET <ip> <port>
 
 本节接下来的内容将首先介绍节点保存槽指派信息的方法，以及节点之间传播槽指派信息的方法，之后再介绍CLUSTER ADDSLOTS命令的实现。
 
-### 记录节点的槽指派信息
+### 节点如何存储自己负责的槽位信息
 
 **clusterNode结构的slots属性和numslot属性记录了节点负责处理哪些槽**：
 
-```
+```c
 struct clusterNode {
   // ...
-  unsigned char slots[16384/8];
+  unsigned char slots[16384/8];   // 位图
   int numslots;
   // ...
 };
 ```
 
-slots属性是一个二进制位数组（bit array）- 位图，这个数组的长度为16384/8=2048个字节，共包含16384个二进制位。每个二进制位的0/1标识着当前clusterNode是否负责处理该槽(是否存储该槽位对应的键值对), Redis以0为起始索引，16383为终止索引，对slots数组中的16384个二进制位进行编号
+slots属性是一个二进制位数组（bit array）- 位图，这个数组的长度为16384/8=2048个字节，共包含16384个二进制位。每个二进制位的0/1标识着当前clusterNode是否负责处理该槽(是否存储该槽位对应的键值对)
+(Redis以0为起始索引，16383为终止索引，对slots数组中的16384个二进制位进行编号)
 
 > 一个slots数组示例：这个数组索引1、3、5、8、9、10上的二进制位的值都为1，而其余所有二进制位的值都为0，这表示节点负责处理槽1、3、5、8、9、10。
 >
@@ -465,7 +479,9 @@ slots属性是一个二进制位数组（bit array）- 位图，这个数组的�
 
 ### 传播节点的槽指派信息 - 通过消息
 
-一个节点除了会将自己负责处理的槽记录在clusterNode结构的slots属性和numslots属性之外，**它还会将自己的slots数组通过消息发送给集群中的其他节点，以此来告知其他节点自己目前负责处理哪些槽。**
+一个节点除了会将自己负责处理的槽记录在clusterNode结构的slots属性和numslots属性之外，**它还会将自己的slots数组(位图)通过消息发送给集群中的其他节点，以此来告知其他节点自己目前负责处理哪些槽。**
+
+(因为每个节点的clusterState会存储集群的状态, 也会以字典的方式存储所有节点对应的clusterNode, 集群的状态当然包含哪个节点当前负责哪些槽位, 所以节点还需要通过消息来通知其他节点自己当前负责处理哪些槽位, 就是保存在字典的clusterNode结构中)
 
 > 举个例子，对于前面展示的包含7000、7001、7002三个节点的集群来说：
 >
@@ -473,35 +489,37 @@ slots属性是一个二进制位数组（bit array）- 位图，这个数组的�
 > - 节点7001会通过消息告知7000, 7002这两个节点，自己负责处理槽5001至槽10000
 > - 节点7002会通过消息告知7000, 7001这两个节点，自己负责处理槽10001至槽16383
 >
-> ![image-20230923151111514](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923151111514.png)
+> <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923151111514.png" alt="image-20230923151111514" style="zoom:67%;" />
 >
 > 节点7001和节点7002类似
 
 **当节点A通过消息从节点B那里接收到节点B的slots数组时，节点A会在自己的clusterState.nodes字典中查找节点B对应的clusterNode结构，并对结构中的slots数组进行保存或者更新。**
 
-因为集群中的每个节点都会将自己的slots数组通过消息发送给集群中的其他节点，并且每个接收到slots数组的节点都会将数组保存到相应节点的clusterNode结构里面，**因此，集群中的每个节点都会知道数据库中的16384个槽分别被指派给了集群中的哪些节点。**
+因为集群中的每个节点都会将自己的slots数组通过消息发送给集群中的其他节点，并且每个接收到slots数组的节点都会将数组保存到相应节点的clusterNode结构里面，**因此，集群中的每个节点都会知道数据库中的16384个槽分别被指派给了集群中的哪些节点。(这里其实也就是集群的状态(之一))**
 
 常规/正常情况下, 每个节点中记录同一个节点状态的clusterNode中的slots是相同的, 都是该节点当前负责的槽位
 
-### 记录集群所有槽的指派信息
+### 记录集群所有槽的负责情况/信息
 
 **clusterState结构中的slots数组记录了集群中所有16384个槽的指派信息：**
 
-```
+```c
 typedef struct clusterState {
   // ...
-  clusterNode *slots[16384];
+  clusterNode *slots[16384];  // clusterNode指针数组
   // ...
 } clusterState;
 ```
 
-**slots数组包含16384个项，每个数组项都是一个指向clusterNode结构的指针**：若槽位号为i的槽位指派给了某节点, 则数组的i下标出存储该节点对应的clusterNode结构, 若尚未指派给任何节点, 则存储NULL
+**slots数组包含16384个项，每个数组项都是一个指向clusterNode结构的指针**：若槽位号为i的槽位指派给了某节点, 则数组的i下标处存储的就是该节点对应的clusterNode结构, 若尚未指派给任何节点, 则存储NULL
 
-> 举个例子，对于7000、7001、7002三个节点来说，它们的clusterState结构的slots数组将会是下图所示的样子：
+> 举个例子，对于7000、7001、7002三个节点来说，它们的clusterState结构的slots数组将会是下图所示的样子：(每个节点都有一个clusterState数组)
 >
 > - 数组项slots[0]至slots[5000]的指针都指向代表节点7000的clusterNode结构，表示槽0至5000都指派给了节点7000。
 > - 数组项slots[5001]至slots[10000]的指针都指向代表节点7001的clusterNode结构，表示槽5001至10000都指派给了节点7001。
 > - 数组项slots[10001]至slots[16383]的指针都指向代表节点7002的clusterNode结构，表示槽10001至16383都指派给了节点7002。
+>
+> 这里的指针指向的clusterNode和字典中的clusterNode*指向的clusterNode是一个clusterNode
 >
 > <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923151428606.png" alt="image-20230923151428606" style="zoom: 50%;" />
 
@@ -512,7 +530,7 @@ typedef struct clusterState {
 >- 如果节点只使用clusterNode.slots数组来记录槽的指派信息，那么为了知道槽i是否已经被指派，或者槽i被指派给了哪个节点，程序需要遍历clusterState.nodes字典中的所有clusterNode结构，检查这些结构的slots数组，直到找到负责处理槽i的节点为止，这个过程的复杂度为O（N），其中N为clusterState.nodes字典保存的clusterNode结构的数量。(一般来说, N不会很多 = =)
 >  <u>而通过将所有槽的指派信息保存在clusterState.slots数组里面，程序要检查槽i是否已经被指派，又或者取得负责处理槽i的节点，只需要访问clusterState.slots[i]的值即可，这个操作的复杂度仅为O（1）</u>
 >
->  举个例子，对于下图所示的slots数组来说，如果程序需要知道槽10002被指派给了哪个节点，那么只要访问数组项slots[10002]，就可以马上知道槽10002被指派给了节点7002
+>  举个例子，对于下图所示的slots数组来说，如果程序需要知道槽10002被指派给了哪个节点，那么只要访问数组项slots[10002]，就可以马上知道槽10002被指派给了节点7002, O(1)复杂度
 >
 >  <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923151640962.png" alt="image-20230923151640962" style="zoom:67%;" />
 >
@@ -520,7 +538,7 @@ typedef struct clusterState {
 >
 >- 当程序需要将某个节点的槽指派信息通过消息发送给其他节点时，程序只需要将相应节点的clusterNode.slots数组整个发送出去就可以了。如果Redis不使用clusterNode.slots数组，而单独使用clusterState.slots数组的话，那么每次要将节点A的槽指派信息传播给其他节点时，程序必须先遍历整个clusterState.slots数组，记录节点A负责处理哪些槽，然后才能发送节点A的槽指派信息，这比直接发送clusterNode.slots数组要麻烦和低效得多。时间复杂度为O(16384)
 
-clusterState.slots数组记录了集群中所有槽的指派信息，而clusterNode.slots数组只记录了clusterNode结构所代表的节点的槽指派信息，这是两个slots数组的关键区别所在。
+clusterState.slots数组记录了集群中所有槽的指派信息，而clusterNode.slots数组只记录了clusterNode结构所代表的节点的槽负责信息，这是两个slots数组的关键区别所在, 各有各的作用。
 
 ### CLUSTER ADDSLOTS命令的实现
 
@@ -532,7 +550,8 @@ CLUSTER ADDSLOTS <slot> [slot ...]
 
 CLUSTER ADDSLOTS命令的实现:
 
-0. 遍历所有输入槽，检查它们是否都是未指派槽 - clusterState.slots[i] == NULL i为所有参数, 若有任何一个槽已经被指派给了某个节点, 则向客户端返回错误，并终止命令执行
+0. 遍历所有输入槽，检查它们是否都是未指派槽 - clusterState.slots[i] == NULL ? true : false, i为所有输入参数, 若有任何一个槽已经被指派给了某个节点, 则向客户端返回错误，并终止命令执行
+   (也就是这个命令无法进行槽指派的转移, 无法进行键值对的转移)
 1. 设置clusterState结构的slots数组, 将slots[i]的指针指向代表当前节点的clusterNode结构
 2. 访问代表当前节点的clusterNode结构的slots数组, 将数组在索引i上的二进制位设置为1
 
@@ -574,8 +593,19 @@ def CLUSTER_ADDSLOTS(*all_input_slots):
 > - 并且clusterNode.slots数组在索引1和索引2上的位被设置成了1。
 >
 > <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923213359884.png" alt="image-20230923213359884" style="zoom: 67%;" />
+
+注意, 上方操作结束之后, 只是在集群中某个节点的内部进行了槽指派的更新, 也就是更新了这个命令的接收节点的数据结构: clusterNode&clusterState, 但是, 其他节点内部还没有更新这次的槽指派的操作
+
+所以, 最后, 在CLUSTER ADDSLOTS命令执行完毕之后, 节点会通过<u>发送消息</u>告知集群中的其他节点，自己目前正在负责处理哪些槽。
+
+> 集群模式中的节点之间的内部通信基本都是通过消息进行的, 命令是给客户端/Redis使用者提供的.
+
+> 总结:
 >
-> 最后，在CLUSTER ADDSLOTS命令执行完毕之后，节点会通过<u>发送消息</u>告知集群中的其他节点，自己目前正在负责处理哪些槽。
+> - 这一部分相对来说还是比较关键的, 因为集群的关键就是槽位的负责情况, 这里是从Redis实现角度告诉你Redis的节点是如何存储当前自己负责的槽位信息以及集群负责的槽位信息的
+> - 实现角度主要是两点: 依旧是clusterNode & clusterState, clusterNode通过位图存储节点负责的槽位信息, clusterState通过一个clusterNode指针数组存储集群的槽位指派信息, 这两者缺一不可
+> - 还有一个关键点是, 节点之间会通过消息来交互自己目前负责哪些槽位, 包括CLUSTER ADDSLOTS实现的结尾也会通过消息告知槽位更新情况
+> - CLUSTER ADDSLOTS的实现主要是通过更新节点数据结构 & 消息来实现的, 消息其实就是上一点所说的, 更新数据结构也就是更新clusterNode & clusterState
 
 ## 3. 在集群中执行命令
 
@@ -584,7 +614,7 @@ def CLUSTER_ADDSLOTS(*all_input_slots):
 当客户端向节点发送与数据库键有关的命令时，接收命令的节点会计算出命令要处理的数据库键属于哪个槽，并检查这个槽是否指派给了自己：
 
 - 如果键所在的槽正好就指派给了当前节点，那么节点直接执行这个命令。
-- <u>如果键所在的槽并没有指派给当前节点，那么节点会向客户端返回一个MOVED错误，指引客户端转向（redirect）至正确的节点，并再次发送之前想要执行的命令。</u>
+- <u>如果键所在的槽并没有指派给当前节点，那么节点会向客户端返回一个MOVED错误，指引客户端转向（redirect）至正确的节点，并再次发送之前想要执行的命令。</u>  (这个步骤是自动进行的, 也就是它是内部实现过程, Redis客户端看不到这个过程)
 
 <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923153144476.png" alt="image-20230923153144476" style="zoom:67%;" />
 
@@ -652,7 +682,7 @@ def CLUSTER_KEYSLOT(key):
 
 当节点计算出键所属的槽i之后，<u>节点就会检查clusterState.slots数组中的项i，根据clusterState.slots[i]是否等于clusterState.myself来判断键所在的槽是否由自己负责：</u>
 
-如果clusterState.slots[i]等于clusterState.myself，那么说明槽i由当前节点负责，<u>节点可以执行客户端发送的命令。</u>
+如果clusterState.slots[i]等于clusterState.myself，那么说明槽i由当前节点负责，<u>节点可以直接执行客户端发送的命令。</u>
 
 ### MOVED错误
 
@@ -697,7 +727,7 @@ MOVED 10086 127.0.0.1:7002
 
 > 被隐藏的MOVED错误
 >
-> 集群模式的redis-cli客户端在接收到MOVED错误时，并不会打印出MOVED错误，而是根据MOVED错误自动进行节点转向，并打印出转向信息，所以我们是看不见节点返回的MOVED错误的：
+> <u>集群模式的redis-cli客户端在接收到MOVED错误时，并不会打印出MOVED错误，而是根据MOVED错误自动进行节点转向，并打印出转向信息，所以我们是看不见节点返回的MOVED错误的</u>：
 >
 > ```c
 > $ redis-cli -c -p 7000 # 集群模式
@@ -721,17 +751,17 @@ MOVED 10086 127.0.0.1:7002
 
 ### 节点数据库的实现
 
-集群节点保存键值对以及键值对过期时间的方式，与第9章里面介绍的单机Redis服务器保存键值对以及键值对过期时间的方式完全相同。
-
-<u>节点和单机服务器在数据库方面的一个区别是，节点只能使用0号数据库，而单机Redis服务器则没有这一限制。</u>
+集群节点保存键值对以及键值对过期时间的方式，与单机Redis服务器保存键值对以及键值对过期时间的方式完全相同。(通过字典)
 
 举个例子，节点7000的数据库状态，数据库中包含列表键"lst"，哈希键"book"，以及字符串键"date"，其中键"lst"和键"book"带有过期时间。
 
 ![image-20230923154141082](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923154141082.png)
 
+<u>节点和单机Redis服务器在数据库方面的一个区别是，节点只能使用0号数据库，而单机Redis服务器则没有这一限制。</u>
+
 <u>另外，除了将键值对保存在数据库里面之外，节点(集群模式的Redis服务器)还会用clusterState结构中的slots_to_keys跳跃表来保存槽和键之间的关系：</u>
 
-```
+```c
 typedef struct clusterState {
   // ...
   zskiplist *slots_to_keys;
@@ -739,20 +769,20 @@ typedef struct clusterState {
 } clusterState;
 ```
 
-<u>slots_to_keys跳跃表每个节点的分值（score）都是一个槽号，而每个节点的成员（member）都是一个数据库键：(按照槽位号对数据库键进行排序)</u>
+<u>slots_to_keys跳跃表每个节点的分值（score）都是一个槽号，而每个节点的成员（member）都是一个数据库键：(按照槽位号对数据库键进行排序)</u>  (Zset有序集合)
 
 - 每当节点往数据库中添加一个新的键值对时，节点就会将这个键以及键的槽号关联到slots_to_keys跳跃表。
 - 当节点删除数据库中的某个键值对时，节点就会在slots_to_keys跳跃表解除被删除键与槽号的关联。
 
-举例: 节点7000将创建类似下图所示的slots_to_keys跳跃表：
-
-- 键"book"所在跳跃表节点的分值为1337.0，这表示键"book"所在的槽为1337。
-- 键"date"所在跳跃表节点的分值为2022.0，这表示键"date"所在的槽为2022。
-- 键"lst"所在跳跃表节点的分值为3347.0，这表示键"lst"所在的槽为3347。
+> 举例: 节点7000将创建类似下图所示的slots_to_keys跳跃表：
+>
+> ![image-20230923154417537](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923154417537.png)
+>
+> - 键"book"所在跳跃表节点的分值为1337.0，这表示键"book"所在的槽为1337。
+> - 键"date"所在跳跃表节点的分值为2022.0，这表示键"date"所在的槽为2022。
+> - 键"lst"所在跳跃表节点的分值为3347.0，这表示键"lst"所在的槽为3347。
 
 **通过在slots_to_keys跳跃表中记录各个数据库键所属的槽，节点可以很方便地对属于某个或某些槽的所有数据库键进行批量操作，例如命令CLUSTER GETKEYSINSLOT命令可以返回最多count个属于槽slot的数据库键，而这个命令就是通过遍历slots_to_keys跳跃表来实现的。**
-
-![image-20230923154417537](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923154417537.png)
 
 > 总结:
 >
@@ -767,6 +797,15 @@ typedef struct clusterState {
 > 上面针对的都是 槽位 和 节点之间的关系: 节点负责了哪些槽, 每个槽指派给了哪些节点.
 >
 > 也就导致了仅有上方的数据无法支持如下操作: 快速取出某槽位/某些槽位中的键值, 此时**使用clusterState的zskiplist *slots_to_keys数据成员即可.  它记录了槽位和键值之间的关系, 并按照槽位号对键值进行了排序**
+>
+> > 总结的是真好= =
+
+> 本节重点回顾:
+>
+> - 上一节讲了如何将槽位指派给节点, 以及节点存储槽位分配情况的方式, 而这里就讲了节点如何处理键值对的相关命令
+> - 计算键属于哪个槽使用了CRC16, 我不是很确定这个是不是哈希函数的一种= =, 计算槽位方法很简单, 判断当前节点是否处理这个槽位也很简单.
+> - Redis客户端在发送键值对相关命令时, 并不知道这个键值对对应的槽号, 存储在哪个节点中, 所以很有可能比如get zzz命令发送的Redis节点, 并不存储这个zzz这个键值, 这种情况怎么处理呢? 就是使用MOVED错误实现
+> - 最后讲了节点数据库的实现方式, 主体和普通Redis服务器存储键值对的方式没有差别, 另外加的就是zskiplist *slots_to_keys;调表, 存储了槽位号和键值之间的关系, 便于根据槽位号取出键值
 
 ## 4. 重新分片
 
@@ -810,7 +849,7 @@ typedef struct clusterState {
 
 2）redis-trib对源节点发送CLUSTER SETSLOT <slot\> MIGRATING <target_id>命令，让源节点准备好将属于槽slot的键值对迁移（migrate）至目标节点。
 
-3）redis-trib向源节点发送CLUSTER GETKEYSINSLOT \<slot> \<count>命令，获得最多count个属于槽slot的键值对的键名（key name）。
+3）redis-trib向源节点发送CLUSTER GETKEYSINSLOT \<slot> \<count>命令，获得最多count个属于槽slot的键值对的键名（key name）。(注意: 这里的CLUSTER GETKEYSINSLOT命令的实现就用到了clusterState中的跳跃表, 也就是存储槽位号和键值的那个数据结构, 见上一节的末尾那里)
 
 4）对于步骤3获得的每个键名，redis-trib都向源节点发送一个MIGRATE ...命令，**将被选中的键原子地从源节点迁移至目标节点。**
 
@@ -823,6 +862,10 @@ typedef struct clusterState {
 <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923160047531.png" alt="image-20230923160047531" style="zoom:67%;" />
 
 <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923160059437.png" alt="image-20230923160059437" style="zoom:67%;" />
+
+> 重新分片, 也就是需要迁移多个槽位号, 一个槽位号可能对应多个键值对
+>
+> 都是通过命令实现的
 
 ## 5. ASK错误
 
@@ -875,9 +918,16 @@ typedef struct clusterState {
 
 ### CLUSTER SETSLOT IMPORTING命令的实现
 
+> importing *v.*[贸易]进口（import 的现在分词）；导入
+>
+> import 
+>
+> - *n.*进口，进口商品；输入，引进；重要性；意思，含意
+> - *v.*进口，输入，引进；导入（计算机）；<旧>意味，表明
+
 **clusterState结构的importing_slots_from数组记录了当前节点正在从其他节点导入的槽：**
 
-```
+```c
 typedef struct clusterState {
   // ...
   clusterNode *importing_slots_from[16384];
@@ -909,9 +959,13 @@ CLUSTER SETSLOT <i> IMPORTING <source_id>
 
 ### CLUSTER SETSLOT MIGRATING命令的实现
 
+> migrating - *v.*迁移；迁徙；移居（migrate 的 ing 形式）
+>
+> migrate - *v.*（候鸟或动物）迁徙；（尤指为找工作）移居，迁移；转移（从一个部位移到另一部位）；把（程序，硬件）从一系统转移到另一系统；改用操作系统
+
 **clusterState结构的migrating_slots_to数组记录了当前节点正在迁移至其他节点的槽：**
 
-```
+```c
 typedef struct clusterState {
    // ...
    clusterNode *migrating_slots_to[16384];
@@ -937,13 +991,15 @@ CLUSTER SETSLOT <i> MIGRATING <target_id>
 > OK
 > ```
 >
-> 那么节点7002的clusterState.migrating_slots_to数组将变成图17-28所示的样子。
+> 那么节点7002的clusterState.migrating_slots_to数组将变成下图所示的样子。
 >
 > <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923160747583.png" alt="image-20230923160747583" style="zoom:67%;" />
 
 ### ASK错误
 
 如果节点收到一个关于键key的命令请求，并且键key所属的槽i正好就指派给了这个节点，那么节点会尝试在自己的数据库里查找键key，如果找到了的话，节点就直接执行客户端发送的命令。
+
+(为什么说是尝试呢? 因为这个槽当前指派给了这个节点, 但是可能该槽处于正在迁移的状态, 也就是这个key可能不在这个节点中存储~而是已经迁移到了其他节点中, 也就是migrating_slots_to[i]处指向的clusterNode)
 
 **与此相反，如果节点没有在自己的数据库里找到键key，那么节点会检查自己的clusterState.migrating_slots_to[i]，看键key所属的槽i是否正在进行迁移，如果槽i的确在进行迁移的话，那么节点会向客户端发送一个ASK错误，引导客户端到正在导入槽i的节点去查找键key。**
 
@@ -963,7 +1019,7 @@ ASK 16198 127.0.0.1:7003
 
 ![image-20230923160933163](https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230923160933163.png)
 
-**接到ASK错误的客户端会根据错误提供的IP地址和端口号，转向至正在导入槽的目标节点，<u>然后首先向目标节点发送一个ASKING命令，之后再重新发送原本想要执行的命令。</u>**
+**接到ASK错误的客户端会根据错误提供的IP地址和端口号，转向至正在导入槽的目标节点，<u>然后首先向目标节点发送一个ASKING命令</u>，之后再重新发送原本想要执行的命令。**
 
 以前面的例子来说，当客户端接收到节点7002返回的以下错误时：
 
@@ -1003,9 +1059,9 @@ def ASKING():
     reply("OK")
 ```
 
-<u>在一般情况下，如果客户端向节点发送一个关于槽i的命令，而槽i又没有指派给这个节点的话，那么节点将向客户端返回一个MOVED错误；但是，如果节点的clusterState.importing_slots_from[i]\(该clusterNode *指针数组记录了正在从其他节点导入到当前节点的槽位)显示当前节点正在从其他节点(其实就是那个数组里存储的指针指向的clusterNode所代表的节点)导入槽i，并且发送命令的客户端带有REDIS_ASKING标识，那么节点将破例执行这个关于槽i的命令一次</u>
+<u>在一般情况下，如果客户端向节点发送一个关于槽i的命令，而槽i又没有指派给这个节点的话，那么节点将向客户端返回一个MOVED错误；但是，如果节点的clusterState.importing_slots_from[i]\(该clusterNode *指针数组记录了正在从其他节点导入到当前节点的槽位的源clusterNode)显示当前节点正在从其他节点(其实就是那个数组里存储的指针指向的clusterNode所代表的节点)导入槽i，并且发送命令的客户端带有REDIS_ASKING标识，那么节点将破例执行这个关于槽i的命令一次</u>
 
-**当客户端接收到ASK错误并转向至正在导入槽的节点时，客户端会先向节点发送一个ASKING命令，然后才重新发送想要执行的命令，这是因为如果客户端不发送ASKING命令，而直接发送想要执行的命令的话，那么客户端发送的命令将被节点拒绝执行，并返回MOVED错误。**(因为根本上此刻这个键值对对应的槽位还没有指派给这个目标节点, 而是正在导入这个节点)
+**当客户端接收到ASK错误并转向至正在导入槽的节点时，客户端会先向节点发送一个ASKING命令，然后才重新发送想要执行的命令，这是因为如果客户端不发送ASKING命令，而直接发送想要执行的命令的话，那么客户端发送的命令将被节点拒绝执行，并返回MOVED错误。**(因为根本上此刻这个键值对对应的槽位还没有指派给这个目标节点, 而是正在向节点导入这个槽位对应的若干键值对)
 
 举个例子，我们可以使用普通模式的redis-cli客户端，向正在导入槽16198的节点7003发送以下命令：
 
@@ -1028,7 +1084,7 @@ OK
 
 **另外要注意的是，客户端的REDIS_ASKING标识是一个一次性标识，当节点执行了一个带有REDIS_ASKING标识的客户端发送的命令之后，客户端的REDIS_ASKING标识就会被移除。**
 
-<u>举个例子，如果我们在成功执行GET命令之后，再次向节点7003发送GET命令，那么第二次发送的GET命令将执行失败，因为这时客户端的REDIS_ASKING标识已经被移除：</u>
+举个例子，如果我们在成功执行GET命令之后，再次向节点7003发送GET命令，那么第二次发送的GET命令将执行失败，因为这时客户端的REDIS_ASKING标识已经被移除：
 
 ```
 127.0.0.1:7003> ASKING       #打开REDIS_ASKING标识
@@ -1051,7 +1107,17 @@ ASK错误和MOVED错误都会导致客户端转向，它们的区别在于：
 
   例如: 键"redis"的槽位为111, 且槽位111的负责权正在从节点A转向节点B, 且此时键redis已经被原子的迁移到了节点B(其余节点不确定, 可能尚未迁移完毕), 则此时客户端向节点A发送get redis, 就会收到ASK错误.
 
+> 总结:
+>
+> 其实ASK错误的核心在于: 重新分片时, 或者说槽位转换时, 也就是槽位从一个节点转而指派给另一个节点时, 需要迁移槽位对应的若干键值对. 而这里的核心在于, 是先迁移完槽位对应的所有键值对, 再修改槽位的指派情况的.
+>
+> 也就导致了当某个键值对对应的槽位不属于当前节点负责时, 有两种情况: 1. 槽位不属于自己负责, 但是对应的键值对正在迁移至自己, 也就是即将指派给自己. 2. 槽位不属于自己负责, 且没有准备指派给自己
+>
+> 对于情况2, 就是返回MOVED错误, 对于情况1, 就是源节点向客户端返回ASK错误, 然后客户端转向即将指派的节点, 先发送ASKING命令, 再发送之前的键值对命令, 而目标节点看到客户端的REDIS_ASKING标识之后就明白了, 这个键值对所属槽位目前不属于我负责, 但是即将指派给我, 且客户端想要操作的键值对已经迁移到我这个节点中了
+
 ## 6. 复制与故障转移
+
+> 集群模式等于若干个主从模式的集合, 而哨兵可以实现自动化的主节点故障转移, 可是集群有没有哨兵监管, 那么集群中某个分片的主节点故障了, 怎么进行故障转移呢? 就是本节要解决的问题.
 
 **Redis集群中的节点分为主节点（master）和从节点（slave），其中主节点用于处理槽，而从节点则用于复制某个主节点，并在被复制的主节点下线时，代替下线主节点继续处理命令请求。** 一个主节点和若干个复制此主节点的从节点称为Redis集群中的一个分片
 
@@ -1081,19 +1147,17 @@ ASK错误和MOVED错误都会导致客户端转向，它们的区别在于：
 
 本节接下来的内容将介绍节点的复制方法，检测节点是否下线的方法，以及对下线主节点进行故障转移的方法。
 
-### 设置从节点&主从节点相关数据结构
+### 设置从节点&集群复制相关数据结构
 
-向一个节点发送命令：
+向一个节点发送命令, **可以让接收命令的节点成为node_id所指定节点的从节点，并开始对主节点进行复制**：
 
 ```
 CLUSTER REPLICATE <node_id>
 ```
 
-**可以让接收命令的节点成为node_id所指定节点的从节点，并开始对主节点进行复制**：
-
 - 接收到该命令的节点首先会在自己的clusterState.nodes字典中找到node_id所对应节点的clusterNode结构，**并将自己的clusterState.myself.slaveof指针指向这个结构**，以此来记录这个节点正在复制的主节点：
 
-  ```
+  ```c
   struct clusterNode {
        // ...
        // 如果这是一个从节点，那么指向主节点
@@ -1113,11 +1177,11 @@ CLUSTER REPLICATE <node_id>
 - clusterState.myself.flags属性的值为REDIS_NODE_SLAVE，表示节点7004是一个从节点。
 - clusterState.myself.slaveof指针指向代表节点7000的结构，表示节点7004正在复制的主节点为节点7000。
 
-<u>一个节点成为从节点，并开始复制某个主节点这一信息会**通过消息**发送给集群中的其他节点，最终集群中的所有节点都会知道某个从节点正在复制某个主节点。</u>
+<u>一个节点成为从节点，并开始复制某个主节点这一信息会**通过消息**发送给集群中的其他节点，最终集群中的所有节点都会知道某个从节点正在复制某个主节点。</u>(只要是集群的状态发生了变化, 如槽指派情况发生变化, 主从复制情况发生变化, 都会通过消息让集群中的所有节点得知这个变化, 因为每个节点都会通过clusterState存储集群的状态)
 
 集群中的所有节点都会在代表主节点的clusterNode结构的slaves属性和numslaves属性中记录正在复制这个主节点的从节点名单：
 
-```
+```c
 struct clusterNode {
     // ...
     // 正在复制这个主节点的从节点数量
@@ -1138,15 +1202,15 @@ struct clusterNode {
 
 ### 故障检测
 
-集群中的每个节点都会定期地向集群中的其他节点发送PING消息，以此来检测对方是否在线，如果接收PING消息的节点没有在规定的时间内，向发送PING消息的节点返回PONG消息，<u>那么发送PING消息的节点就会将接收PING消息的节点标记为疑似下线（probable fail，PFAIL）。</u>(标记疑似下线的方式: PING发送方节点(处于集群状态的Redis服务器)会在自己的clusterState.nodes字典中找到接收PING消息的节点对应的clusterNode结构, 将其中的flags打开REDIS_NODE_PFAIL标记)
+集群中的每个节点都会定期地向集群中的其他节点发送<u>PING消息</u>，以此来检测对方是否在线，如果接收PING消息的节点没有在规定的时间内，向发送PING消息的节点返回PONG消息，<u>那么发送PING消息的节点就会将接收PING消息的节点标记为疑似下线（probable fail，PFAIL）。</u>(标记疑似下线的方式: PING发送方节点(处于集群状态的Redis服务器)会在自己的clusterState.nodes字典中找到接收PING消息的节点对应的clusterNode结构, 将其中的flags打开REDIS_NODE_PFAIL标记)
 
 <img src="https://cdn.jsdelivr.net/gh/DaysOfExperience/blogImage@main/img/image-20230924183423616.png" alt="image-20230924183423616" style="zoom: 67%;" />
 
-集群中的各个节点会通过互相发送消息的方式来交换集群中各个节点的状态信息，例如某个节点认为其他某个节点是处于在线状态、疑似下线状态（PFAIL），还是已下线状态（FAIL）。
+集群中的各个节点会通过互相<u>发送消息的方式</u>来交换集群中各个节点的状态信息(因为某个节点的状态发生变化了, 这也是集群的状态变化, 需要通过消息进行同步)，例如某个节点认为其他某个节点是处于在线状态、疑似下线状态（PFAIL），还是已下线状态（FAIL）。
 
 当一个主节点A通过消息得知主节点B认为主节点C进入了疑似下线状态时，主节点A会在自己的clusterState.nodes字典中找到主节点C所对应的clusterNode结构，并将主节点B的下线报告（failure report）添加到A结点中存储的C对应的clusterNode结构的fail_reports链表里面：(也就是每个节点会记录其他的每个节点, 当前有多少个节点认为你有问题)
 
-```
+```c
 struct clusterNode {
   // ...
   // 一个链表，记录了所有其他节点对该节点的下线报告
@@ -1157,7 +1221,7 @@ struct clusterNode {
 
 每个下线报告由一个clusterNodeFailReport结构表示：(fail_reports是一个存储clusterNodeFailReport结构的链表)
 
-```
+```c
 struct clusterNodeFailReport {
   // 报告目标节点已经下线的节点
   struct clusterNode *node;
@@ -1196,7 +1260,7 @@ struct clusterNodeFailReport {
 >
 > 这个选举新主节点的方法和第16章介绍的选举领头Sentinel的方法非常相似，因为两者都是基于Raft算法的领头选举（leader election）方法来实现的。
 
-简单来说: 从节点发现自己复制的主节点已下线了(其实这个发现一般是通过接收其他主节点发送的该主节点已下线的消息), 就会向所有节点进行拉票(通过广播消息), 而只有负责处理槽的在线主节点有投票权, 谁最先拉票, 主节点就会投给谁, 第一个收集到N/2+1张票的从节点就会成为新的主节点
+简单来说: 从节点发现自己复制的主节点已下线了(这个发现可能是通过接收其他主节点发送的该主节点已下线的消息), 就会向所有节点进行拉票(通过广播消息), 而只有负责处理槽的在线主节点有投票权, 谁最先拉票, 主节点就会投给谁, 第一个收集到N/2+1张票的从节点就会成为新的主节点
 
 ### 被选举的从节点进行故障转移
 
@@ -1204,7 +1268,7 @@ struct clusterNodeFailReport {
 
 1. 被选中的从节点会执行SLAVEOF no one命令，成为新的主节点。
 2. 新的主节点会撤销所有对已下线主节点的槽指派，并将这些槽全部指派给自己。(槽位的负责权的转移)
-3. 新的主节点向集群广播一条PONG消息，这条PONG消息可以让集群中的其他节点立即知道这个节点已经由从节点变成了主节点，并且已经接管了原本由已下线节点负责处理的槽。
+3. 新的主节点向集群广播一条PONG消息，这条PONG消息可以让集群中的其他节点立即知道这个节点已经由从节点变成了主节点，并且已经接管了原本由已下线节点负责处理的槽。(集群状态发生变化)
 
 故障转移完成, 新的主节点开始接收和自己负责处理的槽有关的命令请求
 
@@ -1453,7 +1517,7 @@ clusterMsgDataPublish结构示例
 - 对 Redis 集群的重新分片工作是由客户端执行的， 重新分片的关键是将属于某个槽的所有键值对从一个节点转移至另一个节点。
 - 如果节点 A 正在迁移槽 `i` 至节点 B ， 那么当节点 A 没能在自己的数据库中找到命令指定的数据库键时， 节点 A 会向客户端返回一个 `ASK` 错误， 指引客户端到节点 B 继续查找指定的数据库键。
 - `MOVED` 错误表示槽的负责权已经从一个节点转移到了另一个节点， 而 `ASK` 错误只是两个节点在迁移槽的过程中使用的一种临时措施。
-- 集群里的从节点用于复制主节点， 并在主节点下线时， 代替主节点继续处理命令请求。
+- 集群里的从节点用于复制主节点， 并在主节点下线时，代替主节点继续处理命令请求。
 - 集群中的节点通过发送和接收消息来进行通讯， 常见的消息包括 `MEET` 、 `PING` 、 `PONG` 、 `PUBLISH` 、 `FAIL` 五种。
 
 ## 9. 集群搭建 (基于 docker)
